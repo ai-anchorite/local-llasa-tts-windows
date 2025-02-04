@@ -33,6 +33,8 @@ A powerful, local text-to-speech system powered by Llasa-tts models with a moder
 Clone the repository, install the dependencies, and run the application using the following commands:
 
 ```bash
+conda create -n llasa-tts python=3.9
+conda activate llasa-tts
 git clone https://github.com/nivibilla/local-llasa-tts.git
 cd local-llasa-tts
 pip install -r requirements_native_hf.txt
