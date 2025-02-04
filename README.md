@@ -33,7 +33,7 @@ A powerful, local text-to-speech system powered by Llasa-tts models with a moder
 Clone the repository, install the dependencies, and run the application using the following commands:
 
 ```bash
-conda create -n llasa-tts python=3.9
+conda create -n llasa-tts python=3.10
 conda activate llasa-tts
 git clone https://github.com/justinjohn0306/local-llasa-tts-windows.git
 cd local-llasa-tts
