@@ -1,5 +1,5 @@
 gradio==5.14.0
 https://github.com/justinjohn0306/local-llasa-tts-windows/releases/download/whl/deepspeed-0.15.1+d5315d0-cp310-cp310-win_amd64.whl
-xcodec2-0.1.3-py3-none-any.whl
+https://github.com/justinjohn0306/local-llasa-tts-windows/releases/download/whl/xcodec2-0.1.3-py3-none-any.whl
 bitsandbytes>=0.39.0
-triton-3.0.0-cp310-cp310-win_amd64.whl
+https://github.com/justinjohn0306/local-llasa-tts-windows/releases/download/whl/triton-3.0.0-cp310-cp310-win_amd64.whl
