@@ -36,7 +36,7 @@ Clone the repository, install the dependencies, and run the application using th
 conda create -n llasa-tts python=3.10
 conda activate llasa-tts
 git clone https://github.com/justinjohn0306/local-llasa-tts-windows.git
-cd local-llasa-tts
+cd local-llasa-tts-windows
 pip install -r requirements_native_hf.txt
 pip install -r requirements_base.txt
 python hf_app.py
