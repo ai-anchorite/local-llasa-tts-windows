@@ -430,7 +430,7 @@ def infer(
     if len(target_text) == 0:
         return None, render_previous_generations(prev_history), prev_history
     elif len(target_text) > 1000:
-        gr.warning("Text is too long. Truncating to 1000 characters.")
+        gr.Warning("Text is too long. Truncating to 1000 characters.")
         target_text = target_text[:1000]
     if auto_optimize_length:
         input_len = tokenizer.apply_chat_template(
@@ -465,7 +465,7 @@ def infer(
             vq_code_prompt = vq_code_prompt[0, 0, :]
             speech_ids_prefix = ids_to_speech_tokens(vq_code_prompt)
     elif generation_mode == "Reference audio" and not ref_audio_path:
-        gr.warning("No reference audio provided. Proceeding in text-only mode.")
+        gr.Warning("No reference audio provided. Proceeding in text-only mode.")
     progress(0.5, "Generating speech...")
     combined_input_text = prompt_text + " " + target_text
     prefix_str = "".join(speech_ids_prefix) if speech_ids_prefix else ""
