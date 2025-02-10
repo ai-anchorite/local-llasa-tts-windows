@@ -8,6 +8,7 @@ import argparse
 import json
 import numpy as np
 import random
+import re
 
 print("Initializing system...", flush=True)
 
@@ -535,6 +536,204 @@ def infer(
     prev_history.append(new_entry)
     updated_dashboard_html = render_previous_generations(prev_history, is_generating=False)
     return (sr, out_audio_np), updated_dashboard_html, prev_history
+    
+    
+    
+###############################################################################
+#                             ADD CHUNKING                                    #
+###############################################################################   
+
+
+    
+def chunk_text(text, min_length=200):
+    """Split text into chunks at sentence boundaries."""
+    sentences = re.split(r'(?<=\.|\!|\,|\?)\s+', text)
+    chunks = []
+    current_chunk = ""
+    
+    for sentence in sentences:
+        if len(current_chunk) + len(sentence) + 1 >= min_length:
+            if current_chunk:
+                chunks.append(current_chunk)
+            current_chunk = sentence
+        else:
+            if current_chunk:
+                current_chunk += " " + sentence
+            else:
+                current_chunk = sentence
+    
+    if current_chunk:
+        chunks.append(current_chunk)
+    return chunks
+
+def join_audio_segments(segments, sample_rate=16000, crossfade_duration=0.05):
+    """Concatenate audio segments with crossfade."""
+    if not segments:
+        return np.array([], dtype=np.float32)
+    crossfade_samples = int(sample_rate * crossfade_duration)
+    joined_audio = segments[0]
+    for seg in segments[1:]:
+        if crossfade_samples > 0 and len(joined_audio) >= crossfade_samples and len(seg) >= crossfade_samples:
+            fade_out = np.linspace(1, 0, crossfade_samples)
+            fade_in = np.linspace(0, 1, crossfade_samples)
+            joined_audio[-crossfade_samples:] = joined_audio[-crossfade_samples:] * fade_out + seg[:crossfade_samples] * fade_in
+            joined_audio = np.concatenate([joined_audio, seg[crossfade_samples:]])
+        else:
+            joined_audio = np.concatenate([joined_audio, seg])
+    return joined_audio
+
+def infer_long_text(
+    generation_mode,
+    ref_audio_path,
+    target_text,
+    model_version,
+    hf_api_key,
+    trim_audio,
+    max_length,
+    temperature,
+    top_p,
+    whisper_language,
+    user_seed,
+    random_seed_each_gen,
+    beam_search_enabled,
+    auto_optimize_length,
+    chunk_length=200,
+    prev_history=[],
+    progress=gr.Progress()
+):
+    # Set seed once for the entire generation
+    chosen_seed = random.randint(0, 2**31 - 1) if random_seed_each_gen else user_seed
+    set_seed(chosen_seed)
+    
+    tokenizer, model = get_llasa_model(model_version, hf_api_key=hf_api_key)
+    
+    if len(target_text) == 0:
+        return None, render_previous_generations(prev_history), prev_history
+    
+    # Process reference audio once
+    speech_ids_prefix = []
+    prompt_text = ""
+    prompt_wav = None
+    
+    if generation_mode == "Reference audio" and ref_audio_path:
+        progress(0, "Processing reference audio...")
+        waveform, sample_rate = torchaudio.load(ref_audio_path)
+        if trim_audio and len(waveform[0]) / sample_rate > 15:
+            waveform = waveform[:, :sample_rate * 15]
+        waveform_mono = torch.mean(waveform, dim=0, keepdim=True) if waveform.size(0) > 1 else waveform
+        prompt_wav = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=16000)(waveform_mono)
+        
+        # Get prompt text once
+        whisper_args = {}
+        if whisper_language != "auto":
+            whisper_args["language"] = whisper_language
+        prompt_text = whisper_turbo_pipe(
+            prompt_wav[0].numpy(),
+            generate_kwargs=whisper_args
+        )['text'].strip()
+        
+        # Get voice encoding once
+        with torch.no_grad():
+            vq_code_prompt = Codec_model.encode_code(input_waveform=prompt_wav)
+            vq_code_prompt = vq_code_prompt[0,0,:]
+            speech_ids_prefix = ids_to_speech_tokens(vq_code_prompt)
+    
+    # Chunk the text
+    chunks = chunk_text(target_text, min_length=chunk_length)
+    audio_segments = []
+    
+    # Process each chunk with consistent context
+    for i, chunk in enumerate(chunks):
+        progress(0.2 + (0.6 * (i / len(chunks))), f"Processing chunk {i+1} of {len(chunks)}...")
+        
+        # Use the same prompt_text and speech_ids_prefix for all chunks
+        prefix_str = "".join(speech_ids_prefix) if speech_ids_prefix else ""
+        combined_input_text = prompt_text + " " + chunk if prompt_text else chunk
+            
+        formatted_text = f"<|TEXT_UNDERSTANDING_START|>{combined_input_text}<|TEXT_UNDERSTANDING_END|>"
+        chat = [
+            {"role": "user", "content": "Convert the text to speech:" + formatted_text},
+            {"role": "assistant", "content": "<|SPEECH_GENERATION_START|>" + prefix_str}
+        ]
+        
+        # Use consistent generation parameters
+        model_inputs = tokenizer.apply_chat_template(
+            chat,
+            tokenize=True,
+            return_tensors="pt",
+            continue_final_message=True
+        )
+        
+        input_ids = model_inputs.to("cuda")
+        attention_mask = torch.ones_like(input_ids).to("cuda")
+        
+        chunk_max_length = max_length
+        if auto_optimize_length:
+            input_len = input_ids.shape[1]
+            margin = 100 if generation_mode == "Reference audio" else 50
+            chunk_max_length = min(max_length, input_len + margin)
+            
+        speech_end_id = tokenizer.convert_tokens_to_ids("<|SPEECH_GENERATION_END|>")
+        
+        with torch.no_grad():
+            outputs = model.generate(
+                input_ids,
+                attention_mask=attention_mask,
+                pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+                max_length=int(chunk_max_length),
+                min_length=int(chunk_max_length * 0.5),
+                eos_token_id=speech_end_id,
+                do_sample=True,
+                num_beams=2 if beam_search_enabled else 1,
+                length_penalty=1.5,
+                temperature=float(temperature),
+                top_p=float(top_p),
+                repetition_penalty=1.2,
+                early_stopping=beam_search_enabled,
+                no_repeat_ngram_size=3
+            )
+            
+            prefix_len = len(speech_ids_prefix)
+            generated_ids = outputs[0][(input_ids.shape[1] - prefix_len):-1]
+            speech_tokens = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
+            speech_tokens = extract_speech_ids(speech_tokens)
+            speech_tokens = torch.tensor(speech_tokens).cuda().unsqueeze(0).unsqueeze(0)
+            gen_wav = Codec_model.decode_code(speech_tokens)
+            
+            # Only trim if using reference audio
+            if speech_ids_prefix and prompt_wav is not None:
+                gen_wav = gen_wav[:, :, prompt_wav.shape[1]:]
+                
+            audio_segments.append(gen_wav[0, 0, :].cpu().numpy())
+    
+    # Join segments
+    progress(0.9, "Joining audio segments...")
+    final_audio = join_audio_segments(audio_segments, sample_rate=16000)
+    
+    # Create history entry and return
+    audio_data_url = generate_audio_data_url(final_audio, sample_rate=16000)
+    new_entry = {
+        "mode": generation_mode,
+        "text": target_text,
+        "audio_url": audio_data_url,
+        "temperature": temperature,
+        "top_p": top_p,
+        "max_length": max_length,
+        "seed": chosen_seed,
+    }
+    
+    if len(prev_history) >= MAX_HISTORY:
+        prev_history.pop(0)
+    prev_history.append(new_entry)
+    
+    return (16000, final_audio), render_previous_generations(prev_history), prev_history
+    
+    
+    
+    
+    
+    
+    
 
 ###############################################################################
 #                             NEW DASHBOARD UI                                #
@@ -606,8 +805,23 @@ def build_dashboard():
                             beam_search_checkbox_std = gr.Checkbox(label="Enable beam search", value=False)
                             auto_optimize_checkbox_std = gr.Checkbox(label="[Text Only] Auto Optimize Length", value=True)
                             seed_number_std = gr.Number(label="Seed (if not random)", value=None, precision=0, minimum=0, maximum=2**32-1, step=1)
-                        api_key_input_std = gr.Textbox(label="Hugging Face API Key (Optional, required for 8B)", type="password", placeholder="Enter your HF token or leave blank")
+                            enable_chunking = gr.Checkbox(
+                                label="Enable text chunking for long text",
+                                value=False,
+                                info="Process long text in chunks with smooth transitions"
+                            )
+                            chunk_length = gr.Slider(
+                                minimum=100,
+                                maximum=1000,
+                                value=500,
+                                step=50,
+                                label="Chunk Length",
+                                info="Minimum length of text chunks (in characters)",
+                                visible=False
+                            )
+                        api_key_input_std = gr.Textbox(label="Hugging Face Access Token (Optional, required for gated 8B download [20GB])", type="password", placeholder="Enter your HF token or leave blank")
                         synthesize_btn_std = gr.Button("Synthesize")
+
                         with gr.Group():
                             audio_output_std = gr.Audio(label="Synthesized Audio", type="numpy", interactive=False, show_label=True, autoplay=False)
                     with gr.Column(elem_id="history-panel"):
@@ -655,12 +869,34 @@ def build_dashboard():
                     with gr.Column(elem_id="history-panel"):
                         gr.Markdown("## Previous Generations")
                         dashboard_html_pod = gr.HTML(value="<div style='color: #999; font-style: italic;'>No previous generations yet.</div>", show_label=False)
-        
+
+        enable_chunking.change(
+            lambda x: gr.update(visible=x),
+            inputs=[enable_chunking],
+            outputs=[chunk_length]
+)
+    
         # --- Callback Functions ---
-        def synthesize_standard(generation_mode, ref_audio_input, gen_text_input, model_choice, api_key_input,
-                                max_length_slider, temperature_slider, top_p_slider, whisper_language,
-                                seed_number, random_seed_checkbox, beam_search_checkbox, auto_optimize_checkbox,
-                                trim_audio, prev_history):
+        def synthesize_standard(generation_mode, ref_audio_input, gen_text_input, model_choice,
+                              api_key_input, max_length_slider, temperature_slider, top_p_slider,
+                              whisper_language, seed_number, random_seed_checkbox,
+                              beam_search_checkbox, auto_optimize_checkbox, trim_audio,
+                              enable_chunking, chunk_length, prev_history):
+            if enable_chunking:
+                return infer_long_text(
+                    generation_mode, ref_audio_input, gen_text_input, model_choice,
+                    api_key_input, trim_audio, max_length_slider, temperature_slider,
+                    top_p_slider, whisper_language, seed_number, random_seed_checkbox,
+                    beam_search_checkbox, auto_optimize_checkbox, chunk_length,
+                    prev_history
+                )
+            else:
+                return infer(
+                    generation_mode, ref_audio_input, gen_text_input, model_choice,
+                    api_key_input, trim_audio, max_length_slider, temperature_slider,
+                    top_p_slider, whisper_language, seed_number, random_seed_checkbox,
+                    beam_search_checkbox, auto_optimize_checkbox, prev_history
+                )
             common_params = {
                 "model_version": model_choice,
                 "hf_api_key": api_key_input,
@@ -705,10 +941,15 @@ def build_dashboard():
             outputs=[dashboard_html_std]
         ).then(
             synthesize_standard,
-            inputs=[generation_mode_std, ref_audio_input, gen_text_input, model_choice_std, api_key_input_std,
-                    max_length_slider_std, temperature_slider_std, top_p_slider_std, whisper_language_std,
-                    seed_number_std, random_seed_checkbox_std, beam_search_checkbox_std, auto_optimize_checkbox_std,
-                    trim_audio_checkbox_std, prev_history_state],
+            inputs=[
+                generation_mode_std, ref_audio_input, gen_text_input, model_choice_std,
+                api_key_input_std, max_length_slider_std, temperature_slider_std,
+                top_p_slider_std, whisper_language_std, seed_number_std,
+                random_seed_checkbox_std, beam_search_checkbox_std,
+                auto_optimize_checkbox_std, trim_audio_checkbox_std,
+                enable_chunking, chunk_length,  
+                prev_history_state
+            ],
             outputs=[audio_output_std, dashboard_html_std, prev_history_state]
         )
         
